@@ -268,11 +268,11 @@ if __name__ == "__main__":
     terminated = False
     env.reset()
     while True:
-        #env.render()
-        actions = []
-        for a in env.agents:
-            actions.append(env.action_space.sample())
-        obs, r, terminated, truncated, info = env.step(actions)
-        print(f"obs: {obs}, r: {r}, done: {terminated or truncated}")
+        env.render()
+        #actions = []
+        #for a in env.agents:
+        #    actions.append(env.action_space.sample())
+        #obs, r, terminated, truncated, info = env.step(actions)
+        #print(f"obs: {obs}, r: {r}, done: {terminated or truncated}")
         if terminated:
             env.reset()

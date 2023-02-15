@@ -1,6 +1,6 @@
 """Pareto Q-Learning."""
 from typing import Callable, Optional
-
+import tqdm
 import numpy as np
 import random
 from morl_baselines.common.morl_algorithm import MOAgent
@@ -15,6 +15,10 @@ class PQL(MOAgent):
 
     Tabular method relying on pareto pruning.
     Paper: K. Van Moffaert and A. Nowé, “Multi-objective reinforcement learning using sets of pareto dominating policies,” The Journal of Machine Learning Research, vol. 15, no. 1, pp. 3483–3512, 2014.
+
+    The planning option is the contribution to this agent which implements
+    monte carlo tree search to select an epsilon greedy action using a model 
+    of the environment. 
     """
 
     def __init__(
@@ -30,7 +34,9 @@ class PQL(MOAgent):
         experiment_name: str = "Pareto Q-Learning",
         log: bool = True,
         planning: bool = False,
-        model = None
+        model = None,
+        collect_data = False,
+        print_outputs = False
     ):
         """Initialize the Pareto Q-learning algorithm.
 
@@ -75,10 +81,34 @@ class PQL(MOAgent):
         self.project_name = project_name
         self.experiment_name = experiment_name
         self.log = log
+        self.data = {}
+        self.print_outputs = print_outputs
+        self.collect_data = collect_data
 
         self.planning = planning
-        if planning:
-            self.model = model
+        self.model = model
+
+    def make_new_dataset(self, name):
+        self.data[name] = []
+
+    def collect_episode_data(self, hv, name):
+        self.data[name].append(hv)
+        
+    def get_data(self):
+        max_len = max([len(v) for k,v in self.data.items()])
+        for k, v in self.data.items():
+            if len(v) < max_len:
+                # fill the array with max_len - len(v) None values
+                pad = [None] * (max_len - len(v))
+                self.data[k].extend(pad)
+        return self.data 
+
+    def reset_agent(self):
+        self.counts = np.zeros((self.num_states, self.num_actions))
+        self.non_dominated = [
+            [{tuple(np.zeros(self.num_objectives))} for _ in range(self.num_actions)] for _ in range(self.num_states)
+        ]
+        self.avg_reward = np.zeros((self.num_states, self.num_actions, self.num_objectives))
 
     def get_config(self) -> dict:
         """Get the configuration dictionary.
@@ -183,7 +213,8 @@ class PQL(MOAgent):
         return non_dominated
 
     def train(
-        self, num_episodes: Optional[int] = 3000, log_every: Optional[int] = 100, action_eval: Optional[str] = "hypervolume"
+        self, num_episodes: Optional[int] = 3000, log_every: Optional[int] = 100, action_eval: Optional[str] = "hypervolume",
+        data_ref: Optional[str] = "data"
     ):
         """Learn the Pareto front.
 
@@ -202,53 +233,64 @@ class PQL(MOAgent):
         else:
             raise Exception("No other method implemented yet")
 
-        for episode in range(num_episodes):
-            if episode % log_every == 0:
-                print(f"Training episode {episode + 1}")
+        with tqdm.trange(num_episodes) as t:
+            for episode in t:
+                #if episode % log_every == 0:
+                #    print(f"Training episode {episode + 1}")
 
-            state_, _ = self.env.reset()
-            terminated = False
-            truncated = False
-            #print()
-            while not (terminated or truncated):
-                state = int(np.ravel_multi_index(state_, self.env_shape))
-                if self.planning:
-                    root = MOMCTSNode(
-                        state=state_, num_actions=self.num_actions,
-                        model=self.model, ref_point=self.ref_point, seed=1234,
-                        f=score_func,h=self.calc_non_dominated,
-                        non_dominated_ref=self.non_dominated,
-                        avg_rewards_ref=self.avg_reward,
-                        counts=self.counts
-                    )
-                    if self.rng.uniform(0, 1) < self.epsilon:
-                        actions = self.enabled_actions(state_)
-                        action = random.choice(actions)
+                state_, _ = self.env.reset()
+                terminated = False
+                truncated = False
+                #print()
+                while not (terminated or truncated):
+                    state = int(np.ravel_multi_index(state_, self.env_shape))
+                    if self.planning:
+                        root = MOMCTSNode(
+                            state=state_, num_actions=self.num_actions,
+                            model=self.model, ref_point=self.ref_point, seed=1234,
+                            f=score_func,h=self.calc_non_dominated,
+                            non_dominated_ref=self.non_dominated,
+                            avg_rewards_ref=self.avg_reward,
+                            counts=self.counts
+                        )
+                        if self.rng.uniform(0, 1) < self.epsilon:
+                            actions = self.enabled_actions(state_)
+                            action = random.choice(actions)
+                        else:
+                            action = root.best_action()
                     else:
-                        action = root.best_action()
-                else:
-                    action = self.select_action(state, score_func)
-                next_state, reward, terminated, truncated, _ = self.env.step(action)
-                #print("s", state_)
-                value = self.env.get_map_value((int(state_[0]), int(state_[1])))
-                state_ = next_state
-                next_state = int(np.ravel_multi_index(next_state, self.env_shape))
+                        action = self.select_action(state, score_func)
+                    next_state, reward, terminated, truncated, _ = self.env.step(action)
+                    #print("s", state_)
+                    value = self.env.get_map_value((int(state_[0]), int(state_[1])))
+                    state_ = next_state
+                    next_state = int(np.ravel_multi_index(next_state, self.env_shape))
 
-                self.counts[state, action] += 1
-                self.non_dominated[state][action] = self.calc_non_dominated(next_state)
-                #print("state", state_, "id", state, "a", action, "r", reward, "avg", self.avg_reward[state, action], "c", self.counts[state, action])
-                self.avg_reward[state, action] += (reward - self.avg_reward[state, action]) / self.counts[state, action]
-                #print(f"state", state_, f"ND[{state}, {action}] {self.non_dominated[state][action]}")
-                state = next_state
+                    self.counts[state, action] += 1
+                    self.non_dominated[state][action] = self.calc_non_dominated(next_state)
+                    #print("state", state_, "id", state, "a", action, "r", reward, "avg", self.avg_reward[state, action], "c", self.counts[state, action])
+                    self.avg_reward[state, action] += (reward - self.avg_reward[state, action]) / self.counts[state, action]
+                    #print(f"state", state_, f"ND[{state}, {action}] {self.non_dominated[state][action]}")
+                    state = next_state
 
-            self.epsilon = max(self.final_epsilon, self.epsilon * self.epsilon_decay)
+                self.epsilon = max(self.final_epsilon, self.epsilon * self.epsilon_decay)
 
-            if self.log and episode % log_every == 0:
-                pf = self.get_local_pcs(state=0)
-                print(pf)
-                value = hypervolume(self.ref_point, list(pf))
-                print(f"Hypervolume in episode {episode}: {value}")
-                #self.writer.add_scalar("train/hypervolume", value, episode)
+                if self.log and episode % log_every == 0:
+                    pf = self.get_local_pcs(state=0)
+                    value = hypervolume(self.ref_point, list(pf))
+                    name = "MF PQL" if not self.planning else "MB PQL"
+                    t.set_description(name)
+                    printvalue = f"{value:.3f}"
+                    t.set_postfix(e=episode, HV=printvalue)
+                    if self.print_outputs: 
+                        print(pf)
+                        print(f"Hypervolume in episode {episode}: {value}")
+
+                    if self.collect_data:
+                        self.collect_episode_data(value, data_ref)
+
+                    #self.writer.add_scalar("train/hypervolume", value, episode)
+                
 
         return self.get_local_pcs(state=0)
 
@@ -265,12 +307,13 @@ class PQL(MOAgent):
         total_rew = np.zeros(self.num_objectives)
 
         while not (terminated or truncated):
-            state = np.ravel_multi_index(state, self.env_shape)
+            print("state", state)
+            state_ = np.ravel_multi_index(state, self.env_shape)
             new_target = False
 
             for action in range(self.num_actions):
-                im_rew = self.avg_reward[state, action]
-                non_dominated_set = self.non_dominated[state][action]
+                im_rew = self.avg_reward[state_, action]
+                non_dominated_set = self.non_dominated[state_][action]
                 for q in non_dominated_set:
                     q = np.array(q)
                     if np.all(self.gamma * q + im_rew == target):

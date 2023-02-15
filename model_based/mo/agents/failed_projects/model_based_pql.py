@@ -93,6 +93,13 @@ class DynaPQL(MOAgent):
         self.model_data = model_data
         self.target_data = target_data
 
+    def reset_agent(self):
+        self.counts = np.zeros((self.num_states, self.num_actions))
+        self.non_dominated = [
+            [{tuple(np.zeros(self.num_objectives))} for _ in range(self.num_actions)] for _ in range(self.num_states)
+        ]
+        self.avg_reward = np.zeros((self.num_states, self.num_actions, self.num_objectives))
+
     def get_config(self) -> dict:
         """Get the configuration dictionary.
         Returns:
