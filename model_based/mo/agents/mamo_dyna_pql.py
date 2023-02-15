@@ -1,9 +1,15 @@
-from typing import Callable, Optional
+from typing import Callable, Optional, List
 import numpy as np
 from model_based.tap_models.stapu_env import Progress
 from morl_baselines.common.morl_algorithm import MOAgent
 from morl_baselines.common.pareto import get_non_dominated
 from morl_baselines.common.performance_indicators import hypervolume
+from model_based.mo.planning.mamo.MCTS import MAMOMCTSNode
+from utils.dfa import DFA
+import torch
+from pymoo.indicators.hv import HV
+import random
+
 
 class DynaPQL(MOAgent):
     """Pareto Q-learning.
@@ -15,14 +21,18 @@ class DynaPQL(MOAgent):
         self,
         env,
         ref_point: np.ndarray,
-        gamma: float = 0.8,
-        initial_epsilon: float = 1.0,
+        gamma: float = 1.0, #0.8,
+        initial_epsilon: float = 0.2,
         epsilon_decay: float = 0.99,
         final_epsilon: float = 0.1,
         seed: int = None,
         project_name: str = "MORL-baselines",
         experiment_name: str = "Pareto Q-Learning",
         log: bool = True,
+        tasks: List[DFA] = [],
+        planning = False,
+        model = None,
+        mcts = False
     ):
         """Initialize the Pareto Q-learning algorithm.
         Args:
@@ -44,6 +54,8 @@ class DynaPQL(MOAgent):
         self.initial_epsilon = initial_epsilon
         self.epsilon_decay = epsilon_decay
         self.final_epsilon = final_epsilon
+        self.model = None
+        self.rewards_model = None
 
         # Algorithm setup
         self.seed = seed
@@ -54,10 +66,12 @@ class DynaPQL(MOAgent):
         #low_bound = self.env.observation_space.low
         #high_bound = self.env.observation_space.high
         #self.env_shape = (high_bound[0] - low_bound[0] + 1, high_bound[1] - low_bound[1] + 1)
+        self.env = env
         self.env_shape = env.state_shape
         self.num_states = np.prod(self.env_shape)
         self.num_objectives = self.env.reward_space.shape[0]
-        self.counts = np.zeros((self.num_states, self.num_actions))
+        self.num_agents = self.env.env.num_agents
+        self.counts = np.zeros((self.num_states, self.num_actions, self.num_agents + len(tasks)))
         self.non_dominated = [
             [{tuple(np.zeros(self.num_objectives))} for _ in range(self.num_actions)] for _ in range(self.num_states)
         ]
@@ -70,6 +84,20 @@ class DynaPQL(MOAgent):
 
         #if self.log:
         #    self.setup_wandb(project_name=self.project_name, experiment_name=self.experiment_name)
+        # TODO remove this and replace with model simulation of done or not
+        # i.e. use a model to learn the DFA so we don't store them in the 
+        # algorithm
+        self.tasks = tasks # The DFAs to be included in checking
+
+        # model data for supervised learning
+        self.model_data = None
+        self.target_data = None
+
+        # planning
+        self.planning = planning
+        if planning:
+            self.model = model
+            self.mcts = mcts
 
     def get_config(self) -> dict:
         """Get the configuration dictionary.
@@ -85,6 +113,24 @@ class DynaPQL(MOAgent):
             "seed": self.seed,
         }
 
+    def agent_adjusted_hypervolume(self, qset):
+        # Q set is a list of tuples
+        # we want the team score of the agents and the task scores
+        q_vecs = np.array(qset)
+        # remove all non zero set entries
+        q_vecs = q_vecs[~np.all(q_vecs==0, axis=1)]
+        b = self.team_score(q_vecs[:, :self.num_agents])
+        b_ = np.expand_dims(b, 1)
+        adjusted = np.concatenate((b_, q_vecs[:, self.num_agents:]), axis=1)
+        # adjust zero values to small value
+        adjusted[adjusted == 0] = 0.01
+        return HV(ref_point=self.ref_point * -1)(adjusted * -1)
+
+
+    @staticmethod
+    def team_score(agent_scores):
+        return np.sum(agent_scores, axis=1)
+
     def score_hypervolume(self, state: int):
         """Compute the action scores based upon the hypervolume metric.
         Args:
@@ -93,9 +139,30 @@ class DynaPQL(MOAgent):
             ndarray: A score per action.
         """
         q_sets = [self.get_q_set(state, action) for action in range(self.num_actions)]
-        action_scores = [hypervolume(self.ref_point, list(q_set)) for q_set in q_sets]
+        #action_scores = [hypervolume(self.ref_point, list(q_set)) for q_set in q_sets]
+        action_scores = [self.agent_adjusted_hypervolume(list(q_set)) for q_set in q_sets]
         return action_scores
 
+    def score_pareto_cardinality(self, state: int):
+        """Compute the action scores based upon the Pareto cardinality metric.
+
+        Args:
+            state (int): The current state.
+
+        Returns:
+            ndarray: A score per action.
+        """
+        q_sets = [self.get_q_set(state, action) for action in range(self.num_actions)]
+        candidates = set().union(*q_sets)
+        non_dominated = get_non_dominated(candidates)
+        scores = np.zeros(self.num_actions)
+
+        for vec in non_dominated:
+            for action, q_set in enumerate(q_sets):
+                if vec in q_set:
+                    scores[action] += 1
+
+        return scores
 
     def select_action(self, state: int, score_func: Callable):
         """Select an action in the current state.
@@ -134,12 +201,28 @@ class DynaPQL(MOAgent):
         non_dominated = get_non_dominated(candidates)
         return non_dominated
 
+    def enabled_actions(self, state):
+        valid_actions = []
+        actions = list(range(4))
+        for action in actions:
+            next_state = state[1:3] + self.env.dir[action]
+            if self.env.is_valid_state(next_state):
+                valid_actions.append(action)        
+        Q = state[3:]
+        if all([t.model_is_idle(Q[j]) for j, t in enumerate(self.tasks)]):
+            valid_actions.append(4)
+        for j, t in enumerate(self.tasks):
+            if t.model_not_started(Q[j]):
+                valid_actions.append(6 + j)
+        return valid_actions
+
     def train(
         self, 
         num_episodes: Optional[int] = 3000, 
         log_every: Optional[int] = 100, 
         action_eval: Optional[str] = "hypervolume",
-        k: Optional[int] = 10
+        k: Optional[int] = 10,
+        max_steps = 10
     ):
         """Learn the Pareto front.
         Args:
@@ -150,8 +233,6 @@ class DynaPQL(MOAgent):
             Set: The final Pareto front.
         """
 
-        model = np.nan * np.zeros((self.num_states, self.num_actions, self.reward_dim + 1))
-
         if action_eval == "hypervolume":
             score_func = self.score_hypervolume
         elif action_eval == "pareto_cardinality":
@@ -159,48 +240,87 @@ class DynaPQL(MOAgent):
         else:
             raise Exception("No other method implemented yet")
         ep_count = 0
+        #max_steps = 30
+        #model = np.zeros()
         for episode in range(num_episodes):
+            steps = 0
             if episode % log_every == 0:
                 print(f"Training episode {episode + 1}")
 
-            state, _ = self.env.reset()
-            state = int(np.ravel_multi_index(state, self.env_shape))
+            state_, _ = self.env.reset()
+            state = int(np.ravel_multi_index(state_, self.env_shape))
             terminated = False
             truncated = False
 
-            while not (terminated or truncated):
-                action = self.select_action(state, score_func)
-                
+            while not (terminated or truncated):# and steps < max_steps:
+                Q = state_[3:]
+                if self.planning and self.mcts:
+                    planning_state = state_.astype(np.float32)
+                    planning_state[1:3] = planning_state[1:3] / 10.
+                    root = MAMOMCTSNode(
+                        planning_state, self.num_actions, self.model, self.tasks, 
+                        self.env.state_shape, self.ref_point, self.seed,
+                        score_func, self.calc_non_dominated,
+                        self.non_dominated, self.avg_reward, self.counts, p=1.)
+                    if self.rng.uniform(0, 1) < self.epsilon:
+                        actions = self.enabled_actions(state_)
+                        #action = self.rng.integers(self.num_actions)
+                        action = random.choice(actions)
+                    else:
+                        action = root.best_action()
+                    #action = root.best_action()
+                else:
+                    action = self.select_action(state, score_func)
+                #action_scores = score_func(state)
+                #action = self.rng.choice(np.argwhere(action_scores == np.max(action_scores)).flatten())
+                #task_count_mask = [
+                #    0 if t.is_finished() or not t.in_progress() else 1 for t in self.tasks
+                #]
+                #agent_count_mask = [
+                #    1 if self.env.env.agents[i].active else 0 for i in range(self.env.env.num_agents)
+                #]
+                # To a TD step with the real environment
                 next_state, reward, terminated, truncated, _ = self.env.step(action)
+                #print("s", state_, "a", action, "s'", next_state)
+                state_ = next_state
                 next_state = int(np.ravel_multi_index(next_state, self.env_shape))
-
-                self.counts[state, action] += 1
+                self.counts[state, action] += 1 #np.array(agent_count_mask + task_count_mask)
                 self.non_dominated[state][action] = self.calc_non_dominated(next_state)
-                
-                self.avg_reward[state, action] += (reward - self.avg_reward[state, action]) / self.counts[state, action]
+                #print(self.get_local_pcs(state=0))
+                a = reward - self.avg_reward[state, action]
+                b = self.counts[state, action]
+                self.avg_reward[state, action] +=  a / b #np.divide(a, b, out=np.zeros_like(a), where=b!=0)
+                #if any(q == 2 for q in Q):
+                value = self.env.env.get_map_value((int(state_[1]), int(state_[2])))
+                #if value > 0:
+                print(f"state", state, f"R[{state}, {action}] {np.around(self.avg_reward[state, action], 3)}", f"C {self.counts[state, action]}, Q: {Q}, (x, y): {(int(state_[1]), int(state_[2]))} value: {value}, {self.env.p}")
                 # then there is the model update part here
-                #model[state, action][:self.reward_dim] = self.avg_reward[state, action]
-                #model[state, action][-1] = next_state
+                if self.planning and not self.mcts:
+                    #model[state, action][:self.reward_dim] = self.avg_reward[state, action]
+                    #model[state, action][-1] = next_state
 
-                # and then execute the planner
-                #self.planning_step(model, k)
+                    # and then execute the planner
+                    self.planning_step(model, k)
+                    #self.planning2_step(state_, k, max_steps)
                 
                 state = next_state
+                #steps += 1
 
             self.epsilon = max(self.final_epsilon, self.epsilon * self.epsilon_decay)
 
             if self.log and episode % log_every == 0:
                 pf = self.get_local_pcs(state=0)
                 print(pf)
-                value = hypervolume(self.ref_point, list(pf))
-                print(f"Hypervolume in episode {episode}: {value}")
+                
+                value = self.agent_adjusted_hypervolume(list(pf))
+                print(f"Score in episode {episode}: {value}")
                 #self.writer.add_scalar("train/hypervolume", value, episode)
             ep_count += 1
         return self.get_local_pcs(state=0)
 
     def planning_step(self, model, k):
         # perform k additional updates at random (planning)
-        for _ in range(k):
+        for _ in range(10):
             # find state-action combinations for which we've experienced
             # a reward so far which is not NaN
             candidates = np.array(np.where(~np.isnan(model[:, :, 0]))).T
@@ -223,6 +343,65 @@ class DynaPQL(MOAgent):
             #print("after update", self.non_dominated[state][action])
             self.avg_reward[state, action] += (reward - self.avg_reward[state, action]) / self.counts[state, action]
 
+    def planning2_step(self, state, rollouts, max_steps):
+        # perform some rollouts to seek states with task reward
+        # rollout the model; seek reward
+        # The current state will need to be converted to a model state
+        root_state = np.array([state[0]] + list(state[1:3] * 0.1) + list(state[3:]))
+        for k in range(rollouts):
+            self.perform_rollout(root_state=root_state, max_steps=max_steps)
+
+    def perform_rollout(self, root_state, max_steps):
+        state = root_state
+        done = False
+        #steps = 0
+        p = 1
+        while not done:# and steps < max_steps:
+            stateidx = self.make_table_index(state)
+            actions = self.enabled_actions(state)
+            action = np.random.choice(actions)
+            #action = self.select_action(stateidx, self.score_hypervolume)
+            Q = state[3:]
+            with torch.no_grad():
+                next_state, reward, p = self.model(state, action, p)
+            next_state_idx = self.make_table_index(next_state)
+            #task_count_mask = [
+            #    0 if x.model_is_finished(Q[j]) or not x.model_in_progress(Q[j]) else 1 for j, x in enumerate(self.tasks)
+            #]
+            #agent_count_mask = [
+            #    1 if state[0] == i else 0 for i in range(self.env.env.num_agents)
+            #]
+            self.counts[stateidx, action] += 1 #np.array(agent_count_mask + task_count_mask)
+            self.non_dominated[stateidx][action] = self.calc_non_dominated(int(next_state_idx))
+            a = reward - self.avg_reward[stateidx, action]
+            b = self.counts[stateidx, action]
+            self.avg_reward[stateidx, action] +=  a / b #np.divide(a, b, out=np.zeros_like(a), where=b!=0)
+            #print(f"state", state, "action", action, "next_state", next_state, "Q", Q, "value: ", self.env.env.get_map_value((int(state[1] * 10), int(state[2] * 10))))
+            #print("Q", Q)
+            if all(x.model_is_finished(Q[j]) for j, x in enumerate(self.tasks)):
+                done = True
+            state = next_state
+            #steps += 1
+
+    def enabled_actions(self, state):
+        actions = list(range(4))
+        Q = state[3:]
+        for j in range(len(self.tasks)):
+            if self.tasks[j].model_not_started(Q[j]):
+                actions.append(6 + j)
+        if all(t.model_is_idle(Q[j]) for j, t in enumerate(self.tasks)) and \
+            not all(t.model_is_finished(Q[j]) for j, t in enumerate(self.tasks)):
+            actions.append(4)
+        return actions
+
+    def make_table_index(self, state):
+        env_coors = (state[1:3] * (np.array(self.env_shape)-1.)[1:3]).astype(np.int32)
+        state_int = [int(state[0]), env_coors[0], env_coors[1]]
+        state_int.extend(map(lambda x: int(x), list(state[3:])))
+        state_int = tuple(state_int)
+        sidx = np.ravel_multi_index(state_int, self.env_shape)
+        return sidx
+            
     def track_policy(self, vec):
         """Track a policy from its return vector.
         Args:

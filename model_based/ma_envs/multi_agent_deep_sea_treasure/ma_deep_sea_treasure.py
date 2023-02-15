@@ -50,6 +50,8 @@ CONCAVE_MAP = np.array(
 class DeepSeaTreasure(gym.Env):
     """Deep Sea Treasure environment
 
+    Serves both the dec STAPU, and cent STAPU model based RL types
+
     Adapted from: https://github.com/RunzheYang/MORL
 
     and MO-Gymnasium: https://github.com/Farama-Foundation/MO-Gymnasium
@@ -108,13 +110,20 @@ class DeepSeaTreasure(gym.Env):
         self.agents.append(Agent(0, (0, 0)))
         self.agents.append(Agent(1, (0, 9)))
 
+        if self.float_state:
+            self.agent_init_pos = [(0, 0), (0., 0.9)]
+        else:
+            self.agent_init_pos = [(0, 0), (0, 9)]
+
+        self.env_shape = (11, 11)
+
     def get_map_value(self, pos):
         return self.sea_map[pos[0]][pos[1]]
 
     def is_valid_state(self, state):
         if state[0] >= 0 and state[0] <= 10 and state[1] >= 0 and state[1] <= 10:
-            if self.get_map_value(state) != -10:
-                return True
+            #if self.get_map_value(state) != -10:
+            return True
         return False
 
     def render(self):
@@ -212,10 +221,11 @@ class DeepSeaTreasure(gym.Env):
         # but we also need to be able to handle both agents moving
         # concurrently
         states = []
+        agent_terminal = []
         for agent in self.agents: 
             
             # check that the action is a movement action
-            if action[agent.agent_idx] in list(range(4)):
+            if 0 <= action[agent.agent_idx] < 4:
                 next_state = agent.current_state + self.dir[action[agent.agent_idx]]
             else:
                 next_state = agent.current_state
@@ -229,6 +239,7 @@ class DeepSeaTreasure(gym.Env):
                 terminal = False
             else:
                 terminal = True
+            agent_terminal.append(terminal)
             time_penalty = -1.0
             # If the agent is active and the action is one of the base
             # environment actions then the agent can precipitate a reward
@@ -242,7 +253,7 @@ class DeepSeaTreasure(gym.Env):
             states.append(state)
         if self.render_mode == "human":
             self.render()
-        return states, vec_reward, terminal, False, {}
+        return states, vec_reward, agent_terminal, False, {}
 
     def close(self):
         if self.window is not None:

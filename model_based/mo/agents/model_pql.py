@@ -1,11 +1,18 @@
+"""Pareto Q-Learning."""
 from typing import Callable, Optional
+
 import numpy as np
+import random
 from morl_baselines.common.morl_algorithm import MOAgent
 from morl_baselines.common.pareto import get_non_dominated
 from morl_baselines.common.performance_indicators import hypervolume
 
-class DynaPQL(MOAgent):
+from model_based.mo.planning.single_agent_mo.single_agent_mcts import MOMCTSNode
+
+
+class PQL(MOAgent):
     """Pareto Q-learning.
+
     Tabular method relying on pareto pruning.
     Paper: K. Van Moffaert and A. Nowé, “Multi-objective reinforcement learning using sets of pareto dominating policies,” The Journal of Machine Learning Research, vol. 15, no. 1, pp. 3483–3512, 2014.
     """
@@ -26,6 +33,7 @@ class DynaPQL(MOAgent):
         model = None
     ):
         """Initialize the Pareto Q-learning algorithm.
+
         Args:
             env: The environment.
             ref_point: The reference point for the hypervolume metric.
@@ -68,13 +76,13 @@ class DynaPQL(MOAgent):
         self.experiment_name = experiment_name
         self.log = log
 
-        #if self.log:
-        #    self.setup_wandb(project_name=self.project_name, experiment_name=self.experiment_name)
         self.planning = planning
-        self.model = model
+        if planning:
+            self.model = model
 
     def get_config(self) -> dict:
         """Get the configuration dictionary.
+
         Returns:
             Dict: A dictionary of parameters and values.
         """
@@ -89,8 +97,10 @@ class DynaPQL(MOAgent):
 
     def score_pareto_cardinality(self, state: int):
         """Compute the action scores based upon the Pareto cardinality metric.
+
         Args:
             state (int): The current state.
+
         Returns:
             ndarray: A score per action.
         """
@@ -108,8 +118,10 @@ class DynaPQL(MOAgent):
 
     def score_hypervolume(self, state: int):
         """Compute the action scores based upon the hypervolume metric.
+
         Args:
             state (int): The current state.
+
         Returns:
             ndarray: A score per action.
         """
@@ -117,12 +129,37 @@ class DynaPQL(MOAgent):
         action_scores = [hypervolume(self.ref_point, list(q_set)) for q_set in q_sets]
         return action_scores
 
+    def enabled_actions(self, state):
+        #valid_actions = []
+        #actions = list(range(4))
+        #for action in actions:
+        #    next_state = state + self.env.dir[action]
+        #    if self.env.is_valid_state(next_state):
+        #        valid_actions.append(action)
+        #return valid_actions
+        return list(range(4))
+
+    def get_q_set(self, state: int, action: int):
+        """Compute the Q-set for a given state-action pair.
+
+        Args:
+            state (int): The current state.
+            action (int): The action.
+
+        Returns:
+            A set of Q vectors.
+        """
+        nd_array = np.array(list(self.non_dominated[state][action]))
+        q_array = self.avg_reward[state, action] + self.gamma * nd_array
+        return {tuple(vec) for vec in q_array}
 
     def select_action(self, state: int, score_func: Callable):
         """Select an action in the current state.
+
         Args:
             state (int): The current state.
             score_func (callable): A function that returns a score per action.
+
         Returns:
             int: The selected action.
         """
@@ -131,23 +168,13 @@ class DynaPQL(MOAgent):
         else:
             action_scores = score_func(state)
             return self.rng.choice(np.argwhere(action_scores == np.max(action_scores)).flatten())
-    
-    def get_q_set(self, state: int, action: int):
-        """Compute the Q-set for a given state-action pair.
-        Args:
-            state (int): The current state.
-            action (int): The action.
-        Returns:
-            A set of Q vectors.
-        """
-        nd_array = np.array(list(self.non_dominated[state][action]))
-        q_array = self.avg_reward[state, action] + self.gamma * nd_array
-        return {tuple(vec) for vec in q_array}
 
     def calc_non_dominated(self, state: int):
         """Get the non-dominated vectors in a given state.
+
         Args:
             state (int): The current state.
+
         Returns:
             Set: A set of Pareto non-dominated vectors.
         """
@@ -156,63 +183,62 @@ class DynaPQL(MOAgent):
         return non_dominated
 
     def train(
-        self, 
-        num_episodes: Optional[int] = 3000, 
-        log_every: Optional[int] = 100, 
-        action_eval: Optional[str] = "hypervolume",
-        k: Optional[int] = 10
+        self, num_episodes: Optional[int] = 3000, log_every: Optional[int] = 100, action_eval: Optional[str] = "hypervolume"
     ):
         """Learn the Pareto front.
+
         Args:
             num_episodes (int, optional): The number of episodes to train for.
             log_every (int, optional): Log the results every number of episodes. (Default value = 100)
             action_eval (str, optional): The action evaluation function name. (Default value = 'hypervolume')
+
         Returns:
             Set: The final Pareto front.
         """
-
-        model = np.nan * np.zeros((self.num_states, self.num_actions, self.reward_dim + 1))
-
         if action_eval == "hypervolume":
             score_func = self.score_hypervolume
         elif action_eval == "pareto_cardinality":
             score_func = self.score_pareto_cardinality
         else:
             raise Exception("No other method implemented yet")
-        ep_count = 0
+
         for episode in range(num_episodes):
             if episode % log_every == 0:
                 print(f"Training episode {episode + 1}")
 
-            state, _ = self.env.reset()
-            state = int(np.ravel_multi_index(state, self.env_shape))
+            state_, _ = self.env.reset()
             terminated = False
             truncated = False
-
+            #print()
             while not (terminated or truncated):
-                action = self.select_action(state, score_func)
+                state = int(np.ravel_multi_index(state_, self.env_shape))
+                if self.planning:
+                    root = MOMCTSNode(
+                        state=state_, num_actions=self.num_actions,
+                        model=self.model, ref_point=self.ref_point, seed=1234,
+                        f=score_func,h=self.calc_non_dominated,
+                        non_dominated_ref=self.non_dominated,
+                        avg_rewards_ref=self.avg_reward,
+                        counts=self.counts
+                    )
+                    if self.rng.uniform(0, 1) < self.epsilon:
+                        actions = self.enabled_actions(state_)
+                        action = random.choice(actions)
+                    else:
+                        action = root.best_action()
+                else:
+                    action = self.select_action(state, score_func)
                 next_state, reward, terminated, truncated, _ = self.env.step(action)
-                if any(r > 0  for r in reward):
-                    print(f"episod: {ep_count}, action: {action}"
-                        f", STAPU State: {next_state} state idx: {np.ravel_multi_index(next_state, self.env_shape)}," 
-                        f"reward: {reward}, done: {terminated}")
+                #print("s", state_)
+                value = self.env.get_map_value((int(state_[0]), int(state_[1])))
+                state_ = next_state
                 next_state = int(np.ravel_multi_index(next_state, self.env_shape))
 
                 self.counts[state, action] += 1
-                #print(f"Q[{state}, {action}]", self.get_q_set(state, action))
                 self.non_dominated[state][action] = self.calc_non_dominated(next_state)
-                #print(f"Q'[{state}, {action}]", self.get_q_set(state, action))
-                #if terminated:
-                #    print()
+                #print("state", state_, "id", state, "a", action, "r", reward, "avg", self.avg_reward[state, action], "c", self.counts[state, action])
                 self.avg_reward[state, action] += (reward - self.avg_reward[state, action]) / self.counts[state, action]
-
-                # then there is the model update part here
-                model[state, action][:self.reward_dim] = self.avg_reward[state, action]
-                model[state, action][-1] = next_state
-
-                # and then execute the planner
-                self.planning_step(model, k)
-                
+                #print(f"state", state_, f"ND[{state}, {action}] {self.non_dominated[state][action]}")
                 state = next_state
 
             self.epsilon = max(self.final_epsilon, self.epsilon * self.epsilon_decay)
@@ -223,36 +249,12 @@ class DynaPQL(MOAgent):
                 value = hypervolume(self.ref_point, list(pf))
                 print(f"Hypervolume in episode {episode}: {value}")
                 #self.writer.add_scalar("train/hypervolume", value, episode)
-            ep_count += 1
+
         return self.get_local_pcs(state=0)
-
-    def planning_step(self, model, k):
-        # perform k additional updates at random (planning)
-        for _ in range(k):
-            # find state-action combinations for which we've experienced
-            # a reward so far which is not NaN
-            candidates = np.array(np.where(~np.isnan(model[:, :, 0]))).T
-
-            # select a random row index from the candidates
-            idx = np.random.randint(0, candidates.shape[0], 1)[0]
-
-            # Obtain the randomly selected state and action values from the
-            # candidates
-            state, action = candidates[idx]
-
-            # obtain the expected reward and next state from the model
-            reward = model[state, action][:self.reward_dim]
-            next_state = model[state, action][-1]
-
-            # update the value function
-            self.counts[state, action] += 1
-            #print("before update", self.non_dominated[state][action])
-            self.non_dominated[state][action] = self.calc_non_dominated(int(next_state))
-            #print("after update", self.non_dominated[state][action])
-            self.avg_reward[state, action] += (reward - self.avg_reward[state, action]) / self.counts[state, action]
 
     def track_policy(self, vec):
         """Track a policy from its return vector.
+
         Args:
             vec (array_like): The return vector to track.
         """
@@ -285,8 +287,10 @@ class DynaPQL(MOAgent):
 
     def get_local_pcs(self, state: int = 0):
         """Collect the local PCS in a given state.
+
         Args:
             state (int): The state to get a local PCS for. (Default value = 0)
+
         Returns:
             Set: A set of Pareto optimal vectors.
         """

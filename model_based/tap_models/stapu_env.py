@@ -18,7 +18,7 @@ class STAPU(gym.Env):
     verification LTL
     """
 
-    def __init__(self, base_env: gym.Env, tasks: List[DFA] = [], float_state = False):
+    def __init__(self, base_env: gym.Env, tasks: List[DFA] = [], float_state = False, env_shape = None):
         """
         base_env must be a multi-agent environment otherwise will fail
         """
@@ -29,11 +29,13 @@ class STAPU(gym.Env):
         #self.env.action_space = Discrete(4)
         low_bound = self.env.observation_space.low
         high_bound = self.env.observation_space.high
-        self.env_shape = (high_bound[0] - low_bound[0] + 1, high_bound[1] - low_bound[1] + 1)
+        self.env_shape = (high_bound[0] - low_bound[0] + 1, high_bound[1] - low_bound[1] + 1) if env_shape is None else env_shape
         self.state_shape = [self.env.num_agents, self.env_shape[0], self.env_shape[1]]
         self.state_shape.extend([max(task.states) + 1 for task in self.tasks])
         self.float_state = float_state
         obs_type = np.float32 if self.float_state else np.int32
+        self.reward_norm = np.array([1.] * (self.env.num_agents + len(tasks)))
+        self.p = 1.0
         if self.float_state:
             self.observation_space = Box(low=0.0, high=1.0, shape=(2,), dtype=obs_type)
         else:
@@ -73,16 +75,25 @@ class STAPU(gym.Env):
         # check if the agent has a task active, if it does not then it should not be
         # able to interact with the environment, otherwise an agent may infinitely
         # hold tasks from other agents
-        inProgress = any([task.progress_flag == 1 for task in self.tasks])
-        if inProgress:
-            states, vec_rewards, _, _, _ = self.env.step(actions)
+        Q = [t.current_state for t in self.tasks]
+        x, y = tuple(self.env.get_state(active_agent))
+        value = self.env.get_map_value((int(x), int(y)))
+        inProgress = any([t.in_progress() for t in self.tasks])
+        if action < 4 and inProgress:
+            R_ = [0.] * self.env.num_agents
+            R_[active_agent] =  -1. if value >= 0 else value
+        else:
+            R_  = [0.] * (self.env.num_agents + len(self.tasks))
+            R_[active_agent] =  0 if value >= 0 else value
+        R_[self.env.num_agents:] = [
+            self.tasks[j].model_rewards(Q[j], self.p)
+            for j in range(len(self.tasks))
+        ]
+        if inProgress and action < 4:
+            states, _, _, _, _ = self.env.step(actions)
         else:
             states = [agent.current_state for agent in self.env.agents]
         #agent_task_activated_reward = 0
-        if action >= 6:
-            # Once a task is active it must be completed by the agent who
-            # started working on it by the definition of a switch transition
-            self.tasks[action - 6].activate_task()
         # term and trunc have no effect and only the global DFA will 
         # dictate whether the episode should end or not
         # Each agent will have an updated state
@@ -91,35 +102,43 @@ class STAPU(gym.Env):
         #istate = np.ravel_multi_index(states[active_agent], self.env_shape)
         # Then we also need to report on the task progress as well
         Q = []
+        #print("Q", [t.current_state for t in self.tasks])
+        if self.float_state:
+            x, y = tuple((self.env.get_state(active_agent) * (np.array(self.env_shape) - 1)).astype(np.int32))
+        else:
+            x, y = tuple(self.env.get_state(active_agent))
+        if self.env.get_map_value((int(x), int(y))) < 0:
+            self.p -= 0.2
+        data = {"env": self.env, "x": int(x), "y": int(y), "activate": False, "update": True, "p": self.p}
         for j in range(len(self.tasks)):
             # compute the task progress
-            self.tasks[j].next(self.tasks[j].current_state, self.env, active_agent)
-            Q.append(self.tasks[j].current_state)
-        stapu_state = [active_agent]
-        stapu_state.extend(list(states[active_agent]))
-        stapu_state.extend(Q)
-        if action < 4 and inProgress:
-            R_ = [0.] * self.env.num_agents
-            R_[active_agent] =  vec_rewards[1]
-            R_.extend([r.assign_reward(vec_rewards[0]) for r in self.tasks])
-        else:
-            R_  = [0.] * (self.env.num_agents + len(self.tasks))
+            if action == j + 6:
+                data["activate"] = True
+            else:
+                data["activate"] = False
+            qprime = self.tasks[j].next(self.tasks[j].current_state, data, active_agent)
+            Q.append(qprime)
+
+        #if any(q > 1 for q in Q):
+        #    print("Q", Q)
+        
         # if all of the tasks that an agent is undertaking are either not
         # started or finished then it can enable the special action 
         # otherwise the special action has no effect
         if action == 4 and \
-            all([task.progress_flag in 
-                [Progress.FAILED, Progress.FINISHED, Progress.NOT_STARTED] 
-                for task in self.tasks]) and \
-            not all([task.progress_flag in [Progress.FAILED, Progress.FINISHED] 
-                for task in self.tasks]) and \
+            all([t.is_idle() for t in self.tasks]) and \
+            not all([t.is_finished() for t in self.tasks]) and \
             active_agent < self.env.num_agents - 1:
             # hand over the task to the next agent
             self.env.agents[active_agent].active = False
-            stapu_state[0] += 1
             self.env.agents[active_agent + 1].active = True
-        if all([task.progress_flag in [Progress.FAILED, Progress.FINISHED] 
-                for task in self.tasks]):
+            active_agent += 1
+        stapu_state = [active_agent]
+        if self.float_state:
+            stapu_state[0] = float(1 / self.env.num_agents)
+        stapu_state.extend(list(states[active_agent]))
+        stapu_state.extend(Q)
+        if all([t.is_finished() for t in self.tasks]):
             done = True
         # truncated is always false
         #R = [np.sum(R_[:self.env.num_agents])] + R_[self.env.num_agents:] 
@@ -134,11 +153,13 @@ class STAPU(gym.Env):
         state_ = [active_agent]
         state_.extend(state[active_agent].tolist())
         state_.extend(Q)
+        self.p = 1.
         return np.array(state_), {}
         
 
     def render(self):
         self.env.render()
+
 
 # define a simple test task to make sure that this is working
 # A DFA is defined with tranisition functions 
@@ -162,7 +183,7 @@ def failure(q, env, agent):
     return 2
 
 def find_a_treasure():
-    dfa = DFA(0, [1], [2])
+    dfa = DFA(0, [1], [2], [])
     dfa.add_state(0, treasure_found)
     dfa.add_state(1, accepting)
     dfa.add_state(2, failure)
