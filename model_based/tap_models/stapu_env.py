@@ -108,7 +108,7 @@ class STAPU(gym.Env):
         else:
             x, y = tuple(self.env.get_state(active_agent))
         if self.env.get_map_value((int(x), int(y))) < 0:
-            self.p -= 0.2
+            self.p -= 1.0
         data = {"env": self.env, "x": int(x), "y": int(y), "activate": False, "update": True, "p": self.p}
         for j in range(len(self.tasks)):
             # compute the task progress
@@ -143,6 +143,9 @@ class STAPU(gym.Env):
         # truncated is always false
         #R = [np.sum(R_[:self.env.num_agents])] + R_[self.env.num_agents:] 
         return np.array(stapu_state), R_, done, False, {}
+
+    def convert_state_to_float(self, state):
+        return np.array(state) / (np.array(self.state_shape) - 1)
 
     def reset(self):
         state, _ = self.env.reset()

@@ -81,29 +81,30 @@ class PQL(MOAgent):
         self.project_name = project_name
         self.experiment_name = experiment_name
         self.log = log
-        self.data = {}
+        self.data = []
         self.print_outputs = print_outputs
         self.collect_data = collect_data
 
         self.planning = planning
         self.model = model
 
-    def make_new_dataset(self, name):
-        self.data[name] = []
+    #def make_new_dataset(self, name):
+    #    self.data[name] = []
 
-    def collect_episode_data(self, hv, name):
-        self.data[name].append(hv)
+    def collect_episode_data(self, episode, hv, name, sample):
+        self.data.append([episode, name, sample, hv])
         
-    def get_data(self):
-        max_len = max([len(v) for k,v in self.data.items()])
-        for k, v in self.data.items():
-            if len(v) < max_len:
-                # fill the array with max_len - len(v) None values
-                pad = [None] * (max_len - len(v))
-                self.data[k].extend(pad)
-        return self.data 
+    #def get_data(self):
+    #    max_len = max([len(v) for k,v in self.data.items()])
+    #    for k, v in self.data.items():
+    #        if len(v) < max_len:
+    #            # fill the array with max_len - len(v) None values
+    #            pad = [[None, None]] * (max_len - len(v))
+    #            self.data[k].extend(pad)
+    #    return self.data 
 
     def reset_agent(self):
+        self.epsilon = self.initial_epsilon
         self.counts = np.zeros((self.num_states, self.num_actions))
         self.non_dominated = [
             [{tuple(np.zeros(self.num_objectives))} for _ in range(self.num_actions)] for _ in range(self.num_states)
@@ -214,7 +215,7 @@ class PQL(MOAgent):
 
     def train(
         self, num_episodes: Optional[int] = 3000, log_every: Optional[int] = 100, action_eval: Optional[str] = "hypervolume",
-        data_ref: Optional[str] = "data"
+        data_ref: Optional[str] = "data", sample: Optional[int] = 0
     ):
         """Learn the Pareto front.
 
@@ -287,7 +288,7 @@ class PQL(MOAgent):
                         print(f"Hypervolume in episode {episode}: {value}")
 
                     if self.collect_data:
-                        self.collect_episode_data(value, data_ref)
+                        self.collect_episode_data(episode=episode, hv=value, name=data_ref, sample=sample)
 
                     #self.writer.add_scalar("train/hypervolume", value, episode)
                 

@@ -143,8 +143,6 @@ class MAMOMCTSNode:
             self.non_dominated[state][action] = self.calc_non_dominated(int(next_state_idx))
             self.avg_rewards[state, action] += (reward - self.avg_rewards[state, action]) / self.counts[state, action]
             #print("state", state, "act", action, "ND", self.non_dominated[state][action])
-            
-            #print(f"state", s, "action", action, "next_state", 
             #    next_state, "Q", Q, 
             #    "value: ", self.model.env.get_map_value((int(s[1] * 10), int(s[2] * 10))),
             #    "p", p
@@ -153,6 +151,7 @@ class MAMOMCTSNode:
             #print("R", self.avg_rewards[state, action])
             #print("s: ", current_rollout_state, "act", action, "s'", next_state)
             current_rollout_state = next_state
+            #print("next_state", next_state, "term", self.terminal_rollout(current_rollout_state))
             steps += 1
             #print("rollout of state", self.state, "lasted ", steps)
         return p
@@ -182,7 +181,7 @@ class MAMOMCTSNode:
     def is_fully_expanded(self):
         return len(self._untried_actions) == 0
     
-    def best_child(self, c_param=0.1):
+    def best_child(self, c_param=0.2):
         # we need to choose a child(action) based on the non
         # dominated action choice function
         # the actions scores are a scalar value because 
@@ -215,14 +214,14 @@ class MAMOMCTSNode:
         return current_node
 
     def best_action(self):
-        simulation_no = 10
+        simulation_no = 50
         for i in range(simulation_no):
             self.epsilon = max(self.final_epsilon, self.epsilon * self.epsilon_decay)
             v = self._tree_policy()
-            p = v.rollout()
+            v.rollout()
             v.backpropagate()
         # notice here we return the best child with c_param as 0
-        return self.best_child(c_param=0.1).parent_action
+        return self.best_child(c_param=0.).parent_action
             
 
         
